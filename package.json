@@ -1,0 +1,63 @@
+{
+  "name": "chat-adapter-zappaz",
+  "version": "0.1.0",
+  "description": "Zappaz adapter for Chat SDK and Mastra, connecting WhatsApp sessions through the Zappaz API.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/viiniolliveira/chat-adapter-zappaz.git"
+  },
+  "homepage": "https://github.com/viiniolliveira/chat-adapter-zappaz#readme",
+  "bugs": {
+    "url": "https://github.com/viiniolliveira/chat-adapter-zappaz/issues"
+  },
+  "keywords": [
+    "chat-sdk",
+    "chat-adapter",
+    "zappaz",
+    "whatsapp",
+    "mastra"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "bun@1.4.4",
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external --sourcemap=external && tsc --project tsconfig.build.json",
+    "prepare": "bun run build",
+    "test": "bun test ./test",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src test package.json tsconfig.json tsconfig.build.json biome.json",
+    "format": "biome check --write src test package.json tsconfig.json tsconfig.build.json biome.json"
+  },
+  "peerDependencies": {
+    "chat": "^4.44.0"
+  },
+  "dependencies": {
+    "@chat-adapter/shared": "^4.44.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.1",
+    "@chat-adapter/state-memory": "^4.44.0",
+    "@types/bun": "^1.4.4",
+    "@types/node": "^24.13.3",
+    "chat": "^4.44.0",
+    "typescript": "6.0.3"
+  }
+}
