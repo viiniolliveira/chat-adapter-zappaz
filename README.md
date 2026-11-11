@@ -109,8 +109,8 @@ Se o agente rodar localmente e a Zappaz estiver em um servidor, use um túnel HT
 Não exponha Studio, memória ou APIs administrativas sem autenticação. A Zappaz local não precisa
 estar rodando quando o consumidor usa a instância remota.
 
-O exemplo de agente usado no teste de ponta a ponta permanece em `server/src/mastra/` no
-repositório da Zappaz. Mastra não é dependência deste pacote.
+Esta seção mostra a configuração de uso com Mastra; o repositório não inclui um agente de teste
+executável. Mastra não é dependência deste pacote.
 
 ## Usar com Chat SDK diretamente
 
