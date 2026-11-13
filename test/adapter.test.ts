@@ -162,6 +162,8 @@ describe('Zappaz Chat SDK adapter', () => {
       { debounceMs: 60_001 },
       { humanPauseMs: -1 },
       { humanPauseMs: 2_147_483_648 },
+      { allowedUsers: { conversationIds: ['not-a-uuid'] } },
+      { allowedUsers: { conversationIds: [''] } },
     ]) {
       expect(() => createZappazAdapter({ ...config, ...override })).toThrow(ValidationError)
       expect(() => new ZappazAdapter({ ...config, ...override })).toThrow(ValidationError)
@@ -437,6 +439,8 @@ describe('Zappaz Chat SDK adapter', () => {
       { conversationId: undefined },
       { messageId: undefined },
       { messageId: '' },
+      { chatId: undefined },
+      { chatId: '' },
     ])
       expect((await adapter.handleWebhook(request(webhook(override)))).status).toBe(400)
     expect(api).not.toHaveBeenCalled()
@@ -1306,5 +1310,684 @@ describe('WhatsApp format conversion', () => {
   test('uses the SDK parse budget for oversized untrusted input', () => {
     const value = '*'.repeat(20_000)
     expect(converter.parseIncoming(value).text).toBe(value)
+  })
+})
+
+describe('allowed users', () => {
+  test('matches exact trimmed identifiers across lists without a conversation lookup', async () => {
+    for (const allowedUsers of [
+      { jids: [` ${phone} `] },
+      { jids: ['unrelated'], lids: [' 123456789 '] },
+      { lids: [lid] },
+      { chatIds: [phone] },
+      { conversationIds: [conversationId] },
+      { conversationIds: [otherRecordId], lids: [lid] },
+    ]) {
+      const received: Message[] = []
+      const tasks: Promise<unknown>[] = []
+      const api = mockApi()
+      const { adapter } = await setup(
+        async (message) => {
+          received.push(message)
+        },
+        { allowedUsers },
+      )
+      expect(
+        (await adapter.handleWebhook(request(), { waitUntil: (task) => tasks.push(task) })).status,
+      ).toBe(200)
+      await Promise.all(tasks)
+      expect(received).toHaveLength(1)
+      expect(api).toHaveBeenCalledTimes(1)
+      api.mockRestore()
+    }
+  })
+
+  test('empty policies and non-exact identifiers deny without dispatch', async () => {
+    for (const allowedUsers of [
+      {},
+      { conversationIds: [], jids: [], lids: [], chatIds: [] },
+      { jids: ['5511999999999'] },
+    ]) {
+      const received: Message[] = []
+      const api = mockApi((url) =>
+        Response.json({ data: url.pathname.endsWith(conversationId) ? conversation : raw }),
+      )
+      const { adapter } = await setup(
+        async (message) => {
+          received.push(message)
+        },
+        { allowedUsers },
+      )
+      const response = await adapter.handleWebhook(request())
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('Ignored')
+      expect(received).toHaveLength(0)
+      expect(api).toHaveBeenCalledTimes(allowedUsers.jids?.length ? 2 : 1)
+      api.mockRestore()
+    }
+  })
+
+  test('allows the canonical conversation with optional aliases absent and keeps the thread across chatId changes', async () => {
+    const received: Message[] = []
+    const tasks: Promise<unknown>[] = []
+    const api = mockApi((url) =>
+      Response.json({
+        data: {
+          ...raw,
+          ...(url.pathname.endsWith(otherRecordId)
+            ? { id: otherRecordId, messageId: 'WA456' }
+            : url.pathname.endsWith(mediaId)
+              ? { id: mediaId, messageId: 'WA789' }
+              : {}),
+          sender: { name: 'Maria' },
+        },
+      }),
+    )
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      { allowedUsers: { conversationIds: [conversationId] } },
+    )
+    const options = { waitUntil: (task: Promise<unknown>) => tasks.push(task) }
+    expect(
+      (
+        await adapter.handleWebhook(
+          request(webhook({ chatId: phone, remoteJid: undefined, lid: undefined })),
+          options,
+        )
+      ).status,
+    ).toBe(200)
+    await Promise.all(tasks)
+    expect(
+      (
+        await adapter.handleWebhook(
+          request(
+            webhook({
+              id: otherRecordId,
+              messageId: 'WA456',
+              chatId: phone,
+              remoteJid: phone,
+              lid: null,
+            }),
+          ),
+          options,
+        )
+      ).status,
+    ).toBe(200)
+    await Promise.all(tasks)
+    expect(
+      (
+        await adapter.handleWebhook(
+          request(webhook({ id: mediaId, messageId: 'WA789', chatId: lid, remoteJid: null, lid })),
+          options,
+        )
+      ).status,
+    ).toBe(200)
+    await Promise.all(tasks)
+    expect(received).toHaveLength(3)
+    expect(received.map((message) => message.threadId)).toEqual([
+      adapter.encodeThreadId({ sessionId: config.sessionId, conversationId }),
+      adapter.encodeThreadId({ sessionId: config.sessionId, conversationId }),
+      adapter.encodeThreadId({ sessionId: config.sessionId, conversationId }),
+    ])
+    expect(api).toHaveBeenCalledTimes(3)
+  })
+
+  test('denies a non-allowlisted canonical conversation without alias lookup or audio transcription', async () => {
+    const received: Message[] = []
+    let transcriptionCount = 0
+    const voice = {
+      ...image,
+      type: 'audio',
+      text: null,
+      media: { ...image.media, kind: 'audio', voice: true },
+    }
+    const api = mockApi(() => Response.json({ data: voice }))
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      {
+        allowedUsers: { conversationIds: [otherRecordId] },
+        transcribeAudio: async () => {
+          transcriptionCount++
+          return 'transcription'
+        },
+      },
+    )
+    const response = await adapter.handleWebhook(request(webhook({ type: 'audio' })))
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('Ignored')
+    expect(api).toHaveBeenCalledTimes(1)
+    expect(transcriptionCount).toBe(0)
+    expect(received).toHaveLength(0)
+  })
+
+  test('does not interpret a configured chatId UUID as the persisted conversation ID', async () => {
+    const received: Message[] = []
+    const api = mockApi((url) =>
+      Response.json({ data: url.pathname.endsWith(conversationId) ? conversation : raw }),
+    )
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      { allowedUsers: { chatIds: [conversationId] } },
+    )
+    const response = await adapter.handleWebhook(request())
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('Ignored')
+    expect(received).toHaveLength(0)
+    expect(api).toHaveBeenCalledTimes(2)
+  })
+
+  test('validates persisted identity before allowing a matching canonical conversation', async () => {
+    const received: Message[] = []
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      { allowedUsers: { conversationIds: [conversationId] } },
+    )
+    for (const override of [
+      { id: otherRecordId },
+      { conversationId: otherRecordId },
+      { sessionId: 'other-session' },
+      { messageId: 'OTHER_WA_ID' },
+    ]) {
+      const api = mockApi(() => Response.json({ data: { ...raw, ...override } }))
+      expect((await adapter.handleWebhook(request())).status).toBe(503)
+      expect(api).toHaveBeenCalledTimes(1)
+      api.mockRestore()
+    }
+    expect(received).toHaveLength(0)
+  })
+
+  test('resolves conversation aliases only after confirming persisted identity', async () => {
+    for (const allowedUsers of [{ jids: [phone] }, { lids: [lid] }, { chatIds: [phone] }]) {
+      const received: Message[] = []
+      const tasks: Promise<unknown>[] = []
+      const api = mockApi((url) =>
+        Response.json({
+          data: url.pathname.endsWith(conversationId)
+            ? conversation
+            : { ...raw, sender: { ...raw.sender, jid: null } },
+        }),
+      )
+      const { adapter } = await setup(
+        async (message) => {
+          received.push(message)
+        },
+        { allowedUsers },
+      )
+      expect(
+        (
+          await adapter.handleWebhook(
+            request(webhook({ remoteJid: null, lid: null, chatId: null })),
+            { waitUntil: (task) => tasks.push(task) },
+          )
+        ).status,
+      ).toBe(200)
+      await Promise.all(tasks)
+      expect(received).toHaveLength(1)
+      expect(api).toHaveBeenCalledTimes(2)
+      expect(new URL(String(api.mock.calls[1][0])).pathname).toEndWith(
+        `/conversations/${conversationId}`,
+      )
+      api.mockRestore()
+    }
+  })
+
+  test('fails closed on invalid or unavailable conversation aliases and mismatched message identity', async () => {
+    for (const result of [
+      null,
+      { ...conversation, id: otherRecordId },
+      { ...conversation, sessionId: 'other' },
+    ]) {
+      const received: Message[] = []
+      const api = mockApi((url) =>
+        url.pathname.endsWith(conversationId)
+          ? result
+            ? Response.json({ data: result })
+            : new Response(null, { status: 500 })
+          : Response.json({ data: raw }),
+      )
+      const { adapter } = await setup(
+        async (message) => {
+          received.push(message)
+        },
+        { allowedUsers: { jids: ['other@example.com'] } },
+      )
+      expect((await adapter.handleWebhook(request())).status).toBe(503)
+      expect(received).toHaveLength(0)
+      expect(api).toHaveBeenCalledTimes(2)
+      api.mockRestore()
+    }
+    const api = mockApi(() => Response.json({ data: { ...raw, id: otherRecordId } }))
+    const { adapter } = await setup(async () => {}, { allowedUsers: { jids: [phone] } })
+    expect((await adapter.handleWebhook(request())).status).toBe(503)
+    expect(api).toHaveBeenCalledTimes(1)
+  })
+
+  test('does not trust an outbound sender as the recipient when deciding human pause', async () => {
+    const api = mockApi((url) =>
+      Response.json({
+        data: url.pathname.endsWith(conversationId)
+          ? { ...conversation, jid: 'other@s.whatsapp.net', contact: null }
+          : { ...raw, fromMe: true, orderAt: new Date().toISOString() },
+      }),
+    )
+    const { adapter } = await setup(async () => {}, {
+      humanPauseMs: 60_000,
+      allowedUsers: { jids: [phone] },
+    })
+    const threadId = adapter.encodeThreadId({ sessionId: config.sessionId, conversationId })
+    const response = await adapter.handleWebhook(
+      request({
+        ...webhook({ fromMe: true, remoteJid: null, lid: null, chatId: null }),
+        event: 'outbound-message.upsert',
+      }),
+    )
+    expect(response.status).toBe(200)
+    expect(await adapter.isThreadPaused(threadId)).toBe(false)
+    expect(api).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('voice transcription', () => {
+  const voice = {
+    ...image,
+    type: 'audio',
+    text: null,
+    media: { ...image.media, kind: 'audio', mimeType: null, fileName: null, voice: true },
+  } satisfies ZappazMessage
+
+  test('downloads authenticated voice bytes, normalizes metadata and dispatches transcription with raw attachment', async () => {
+    const received: Message[] = []
+    const tasks: Promise<unknown>[] = []
+    const bytes = Buffer.from('voice bytes')
+    const api = mockApi((url) =>
+      url.pathname.endsWith('/content') ? new Response(bytes) : Response.json({ data: voice }),
+    )
+    const calls: unknown[] = []
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      {
+        transcribeAudio: async (input) => {
+          calls.push(input)
+          return 'Olá transcrito'
+        },
+      },
+    )
+    expect(
+      (
+        await adapter.handleWebhook(request(webhook({ type: 'audio' })), {
+          waitUntil: (task) => tasks.push(task),
+        })
+      ).status,
+    ).toBe(200)
+    await Promise.all(tasks)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      data: bytes,
+      mimeType: 'audio/ogg',
+      fileName: 'voice.ogg',
+      voice: true,
+      message: voice,
+    })
+    expect(received).toHaveLength(1)
+    expect(received[0].text).toBe('Olá transcrito')
+    expect(received[0].raw).toMatchObject(voice)
+    expect(received[0].attachments[0]).toMatchObject({
+      type: 'audio',
+      mimeType: 'audio/ogg',
+      name: 'voice.ogg',
+    })
+    expect(api).toHaveBeenCalledTimes(2)
+  })
+
+  test('normalizes MIME parameters and keeps voice downloads lazy without a callback', async () => {
+    const api = mockApi(() => new Response('voice'))
+    const adapter = createZappazAdapter(config)
+    for (const mimeType of [null, '  ', ' Audio/OGG; codecs=opus ']) {
+      const attachment = adapter.parseMessage({ ...voice, media: { ...voice.media, mimeType } })
+        .attachments[0]
+      expect(attachment).toMatchObject({ mimeType: 'audio/ogg', name: 'voice.ogg' })
+      expect(api).toHaveBeenCalledTimes(0)
+      expect(
+        await adapter.rehydrateAttachment(JSON.parse(JSON.stringify(attachment))).fetchData?.(),
+      ).toEqual(Buffer.from('voice'))
+      api.mockClear()
+    }
+  })
+
+  test('does not download or transcribe denied audio', async () => {
+    let transcriptions = 0
+    const api = mockApi(() => Response.json({ data: voice }))
+    const { adapter } = await setup(
+      async () => {
+        throw new Error('unexpected dispatch')
+      },
+      {
+        allowedUsers: {},
+        transcribeAudio: async () => {
+          transcriptions++
+          return 'text'
+        },
+      },
+    )
+    const response = await adapter.handleWebhook(request(webhook({ type: 'audio' })))
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('Ignored')
+    expect(transcriptions).toBe(0)
+    expect(api).toHaveBeenCalledTimes(1)
+  })
+
+  test('fails closed on transcription errors and blank results', async () => {
+    for (const transcribeAudio of [
+      async () => {
+        throw new Error('failed')
+      },
+      async () => ' \n ',
+    ]) {
+      const received: Message[] = []
+      const api = mockApi((url) =>
+        url.pathname.endsWith('/content') ? new Response('voice') : Response.json({ data: voice }),
+      )
+      const { adapter } = await setup(
+        async (message) => {
+          received.push(message)
+        },
+        { transcribeAudio },
+      )
+      expect((await adapter.handleWebhook(request(webhook({ type: 'audio' })))).status).toBe(503)
+      expect(received).toHaveLength(0)
+      expect(api).toHaveBeenCalledTimes(2)
+      api.mockRestore()
+    }
+  })
+
+  test('retains transcribed text in a debounced batch', async () => {
+    const received: Message[] = []
+    const tasks: Promise<unknown>[] = []
+    mockApi((url) =>
+      url.pathname.endsWith('/content')
+        ? new Response('voice')
+        : Response.json({
+            data: url.pathname.endsWith(otherRecordId)
+              ? {
+                  ...voice,
+                  id: otherRecordId,
+                  messageId: 'WA456',
+                  media: { ...voice.media, messageRecordId: otherRecordId },
+                }
+              : raw,
+          }),
+    )
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      { debounceMs: 20, transcribeAudio: async () => 'fala transcrita' },
+    )
+    const options = { waitUntil: (task: Promise<unknown>) => tasks.push(task) }
+    await adapter.handleWebhook(request(), options)
+    await adapter.handleWebhook(
+      request(webhook({ id: otherRecordId, messageId: 'WA456', type: 'audio' })),
+      options,
+    )
+    await Promise.all(tasks)
+    expect(received).toHaveLength(1)
+    expect(received[0].text).toContain('Olá')
+    expect(received[0].text).toContain('fala transcrita')
+    expect(received[0].text).not.toContain('[audio]')
+    expect(received[0].attachments).toHaveLength(1)
+  })
+})
+
+describe('incoming quoted messages', () => {
+  const quote = {
+    messageRecordId: otherRecordId,
+    messageId: 'QUOTED_WA_ID',
+    senderJid: '198831635488829@lid',
+    fromMe: false,
+    type: 'text',
+    text: 'Recebi a imagem!',
+  }
+  const marker = '[Mensagem citada (contexto, não é a mensagem atual)]'
+  const end = '[Fim da mensagem citada]'
+  const context = (id: string, sender: string | null, text: string, body: string) =>
+    `${marker}\nID: ${id}${sender ? `\nRemetente: ${sender}` : ''}\n${text}\n${end}\n\n${body}`
+
+  test('includes the persisted quote as context in parsed messages and history', async () => {
+    const quoted = { ...raw, text: 'Qual é a resposta?', replyTo: quote }
+    const adapter = createZappazAdapter(config)
+    const parsed = adapter.parseMessage(quoted)
+    expect(parsed.text).toBe(
+      context(otherRecordId, quote.senderJid, quote.text, 'Qual é a resposta?'),
+    )
+    expect(parsed.raw).toMatchObject({ replyTo: quote })
+    expect(parsed.replyTo).toBeUndefined()
+    const api = mockApi(() =>
+      Response.json({ data: [quoted], page: { hasMore: false, nextCursor: null } }),
+    )
+    const history = await adapter.fetchMessages(
+      adapter.encodeThreadId({ sessionId: config.sessionId, conversationId }),
+    )
+    expect(history.messages[0].text).toBe(parsed.text)
+    expect(history.messages[0].raw).toMatchObject({ replyTo: quote })
+    expect(api).toHaveBeenCalledTimes(1)
+  })
+
+  test('falls back to the authenticated user-shaped webhook snapshot when persisted reply is absent or null', async () => {
+    for (const persistedReply of [undefined, null]) {
+      const received: Message[] = []
+      const tasks: Promise<unknown>[] = []
+      const api = mockApi(() =>
+        Response.json({ data: { ...raw, text: 'E agora?', replyTo: persistedReply } }),
+      )
+      const { adapter } = await setup(
+        async (message) => {
+          received.push(message)
+        },
+        { allowedUsers: { lids: [lid] } },
+      )
+      const event = webhook({
+        sender: { id: '' },
+        remoteJid: phone,
+        lid,
+        chatId: lid,
+        replyTo: {
+          id: '3EB01CCCEC09D8E6A13B8F',
+          text: 'Recebi a imagem!...',
+          type: 'text',
+          senderId: '198831635488829@lid',
+        },
+      })
+      const response = await adapter.handleWebhook(request(event), {
+        waitUntil: (task) => tasks.push(task),
+      })
+      expect(response.status).toBe(200)
+      await Promise.all(tasks)
+      expect(received).toHaveLength(1)
+      expect(received[0].text).toBe(
+        context('3EB01CCCEC09D8E6A13B8F', '198831635488829@lid', 'Recebi a imagem!...', 'E agora?'),
+      )
+      expect(received[0].raw).toMatchObject({
+        replyTo: {
+          messageId: '3EB01CCCEC09D8E6A13B8F',
+          senderJid: '198831635488829@lid',
+          type: 'text',
+          text: 'Recebi a imagem!...',
+        },
+      })
+      expect(received[0].replyTo).toBeUndefined()
+      expect(api).toHaveBeenCalledTimes(1)
+      api.mockRestore()
+    }
+  })
+
+  test('prefers persisted context over a conflicting webhook snapshot', async () => {
+    const received: Message[] = []
+    const tasks: Promise<unknown>[] = []
+    mockApi(() => Response.json({ data: { ...raw, text: 'Pergunta atual?', replyTo: quote } }))
+    const { adapter } = await setup(async (message) => {
+      received.push(message)
+    })
+    const event = webhook({
+      replyTo: { id: 'UNTRUSTED_ID', senderId: phone, type: 'text', text: 'Outro texto' },
+    })
+    expect(
+      (await adapter.handleWebhook(request(event), { waitUntil: (task) => tasks.push(task) }))
+        .status,
+    ).toBe(200)
+    await Promise.all(tasks)
+    expect(received[0].text).toBe(
+      context(otherRecordId, quote.senderJid, quote.text, 'Pergunta atual?'),
+    )
+    expect(received[0].raw).toMatchObject({ replyTo: quote })
+    expect(received[0].text).not.toContain('Outro texto')
+  })
+
+  test('handles absent and deleted quotes and renders media quotes without downloading them', () => {
+    const api = mockApi()
+    const adapter = createZappazAdapter(config)
+    expect(adapter.parseMessage(raw).text).toBe('Olá')
+    expect(adapter.parseMessage({ ...raw, replyTo: null }).text).toBe('Olá')
+    const deleted = { ...raw, deletedAt: raw.orderAt, replyTo: quote }
+    expect(adapter.parseMessage(deleted).text).toBe('[Mensagem apagada]')
+    const mediaQuote = {
+      ...raw,
+      text: 'O que disse?',
+      replyTo: { messageId: 'MEDIA_ID', senderJid: null, type: 'audio', text: null },
+    }
+    expect(adapter.parseMessage(mediaQuote).text).toBe(
+      context('MEDIA_ID', null, '[audio]', 'O que disse?'),
+    )
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  test('limits quoted text to 8192 characters without truncating the current message', () => {
+    const longQuote = {
+      ...raw,
+      text: 'Pergunta atual?',
+      replyTo: { ...quote, text: 'x'.repeat(9000) },
+    }
+    const result = createZappazAdapter(config).parseMessage(longQuote).text
+    expect(result).toContain('x'.repeat(8192))
+    expect(result).not.toContain('x'.repeat(8193))
+    expect(result).toEndWith(`${end}\n\nPergunta atual?`)
+  })
+
+  test('preserves quoted context around a live audio transcription', async () => {
+    const received: Message[] = []
+    const tasks: Promise<unknown>[] = []
+    const voice = {
+      ...image,
+      type: 'audio',
+      text: null,
+      replyTo: quote,
+      media: {
+        ...image.media,
+        kind: 'audio',
+        voice: true,
+        mimeType: 'audio/ogg',
+        fileName: 'voice.ogg',
+      },
+    }
+    const api = mockApi((url) =>
+      url.pathname.endsWith('/content') ? new Response('voice') : Response.json({ data: voice }),
+    )
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      { transcribeAudio: async () => 'Qual é o valor?' },
+    )
+    expect(
+      (
+        await adapter.handleWebhook(request(webhook({ type: 'audio' })), {
+          waitUntil: (task) => tasks.push(task),
+        })
+      ).status,
+    ).toBe(200)
+    await Promise.all(tasks)
+    expect(received[0].text).toBe(
+      context(otherRecordId, quote.senderJid, quote.text, 'Qual é o valor?'),
+    )
+    expect(received[0].raw).toMatchObject({ replyTo: quote })
+    expect(received[0].attachments).toHaveLength(1)
+    expect(api).toHaveBeenCalledTimes(2)
+  })
+
+  test('keeps each quote exactly once in a debounced batch', async () => {
+    const received: Message[] = []
+    const tasks: Promise<unknown>[] = []
+    const secondQuote = {
+      ...quote,
+      messageRecordId: null,
+      messageId: 'SECOND_QUOTE',
+      text: 'Segundo contexto',
+    }
+    mockApi((url) =>
+      Response.json({
+        data: url.pathname.endsWith(otherRecordId)
+          ? {
+              ...raw,
+              id: otherRecordId,
+              messageId: 'WA456',
+              text: 'Segunda pergunta?',
+              replyTo: secondQuote,
+            }
+          : { ...raw, text: 'Primeira pergunta?', replyTo: quote },
+      }),
+    )
+    const { adapter } = await setup(
+      async (message) => {
+        received.push(message)
+      },
+      { debounceMs: 20 },
+    )
+    const options = { waitUntil: (task: Promise<unknown>) => tasks.push(task) }
+    expect((await adapter.handleWebhook(request(), options)).status).toBe(200)
+    expect(
+      (
+        await adapter.handleWebhook(
+          request(webhook({ id: otherRecordId, messageId: 'WA456' })),
+          options,
+        )
+      ).status,
+    ).toBe(200)
+    await Promise.all(tasks)
+    expect(received).toHaveLength(1)
+    expect(received[0].text).toContain(
+      context(otherRecordId, quote.senderJid, quote.text, 'Primeira pergunta?'),
+    )
+    expect(received[0].text).toContain(
+      context('SECOND_QUOTE', secondQuote.senderJid, secondQuote.text, 'Segunda pergunta?'),
+    )
+    expect(received[0].text.split(marker)).toHaveLength(3)
+    expect(received[0].text.split(end)).toHaveLength(3)
+  })
+
+  test('does not dispatch or use webhook quotes before authentication, validation and identity checks', async () => {
+    const received: Message[] = []
+    const api = mockApi(() => Response.json({ data: { ...raw, id: otherRecordId } }))
+    const { adapter } = await setup(async (message) => {
+      received.push(message)
+    })
+    const replyTo = { id: 'QUOTED', text: 'texto', type: 'text', senderId: lid }
+    expect((await adapter.handleWebhook(request(webhook({ replyTo }), 'wrong'))).status).toBe(401)
+    expect(api).not.toHaveBeenCalled()
+    expect(
+      (await adapter.handleWebhook(request(webhook({ replyTo: { ...replyTo, id: '' } })))).status,
+    ).toBe(400)
+    expect(api).not.toHaveBeenCalled()
+    expect((await adapter.handleWebhook(request(webhook({ replyTo })))).status).toBe(503)
+    expect(api).toHaveBeenCalledTimes(1)
+    expect(received).toHaveLength(0)
   })
 })

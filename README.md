@@ -1,4 +1,4 @@
-# chat-adapter-zappaz
+# @zappaz/chat-adapter-zappaz
 
 Adapter da [Zappaz](https://github.com/viiniolliveira/zappaz-lite) para o
 [Chat SDK](https://chat-sdk.dev/), compatível com os
@@ -9,8 +9,7 @@ HTTP e os webhooks normalizados. O adapter roda **no consumidor**, não dentro d
 depende de Prisma ou Baileys.
 
 **Versão experimental:** texto e arquivos, citação de mensagens, histórico bidirecional,
-agrupamento opcional de mensagens e pausa para atendimento humano. Este repositório é público,
-mas o pacote ainda não foi publicado no npm.
+agrupamento opcional de mensagens e pausa para atendimento humano.
 
 ## Requisitos
 
@@ -21,7 +20,13 @@ mas o pacote ainda não foi publicado no npm.
 - Chat SDK `^4.44.0` no consumidor; Node.js 22+ ou Bun.
 - Bun para instalar, desenvolver e compilar este pacote ESM.
 
-## Instalação sem npm
+## Instalação
+
+```bash
+bun add chat @zappaz/chat-adapter-zappaz
+```
+
+### Instalação local para desenvolvimento
 
 Clone e compile o adapter:
 
@@ -38,7 +43,7 @@ No seu projeto Chat SDK ou Mastra, instalado ao lado da pasta do adapter:
 bun add chat ../chat-adapter-zappaz
 ```
 
-O nome usado no import é `chat-adapter-zappaz`, conforme o manifesto, independentemente de ter sido
+O nome usado no import é `@zappaz/chat-adapter-zappaz`, conforme o manifesto, independentemente de ter sido
 instalado pelo caminho local. O pacote fornece JavaScript ESM e declarações TypeScript em `dist/`.
 `bun install` executa `prepare` para gerar o build; `bun run build` também pode ser executado
 explicitamente. Não copie somente `src/index.ts`: o pacote inclui o cliente HTTP e o parser de
@@ -47,7 +52,7 @@ formatação, sem imports para arquivos da aplicação Zappaz.
 ## Configuração
 
 ```ts
-import { createZappazAdapter } from 'chat-adapter-zappaz'
+import { createZappazAdapter } from '@zappaz/chat-adapter-zappaz'
 
 const adapter = createZappazAdapter({
   baseUrl: 'https://zappaz.example.com',
@@ -67,6 +72,8 @@ const adapter = createZappazAdapter({
 | `debounceMs` | Janela de agrupamento, de 0 a 60.000 ms. Padrão: 0 (desativado). |
 | `humanPauseMs` | Duração da pausa após saída humana, até 2.147.483.647 ms. Padrão: 0 (desativado). |
 | `splitLongMessages` | Divide textos longos em partes de até 4.096 caracteres. Padrão: `true`. |
+| `allowedUsers` | Lista de permissões por `conversationIds` (preferencial), `jids`, `lids` ou `chatIds`. Ausente permite todos; vazia não permite ninguém. |
+| `transcribeAudio` | Callback opcional que recebe áudio autenticado e retorna texto antes de acionar o agente. |
 
 O adapter não lê variáveis de ambiente automaticamente. Injete a configuração pelo consumidor,
 valide seu ambiente na inicialização e nunca versione chaves reais. Use HTTPS fora do
@@ -77,7 +84,7 @@ desenvolvimento local. Para gerar um segredo localmente: `openssl rand -hex 32`.
 Adicione esta configuração ao `Agent` existente:
 
 ```ts
-import { createZappazAdapter } from 'chat-adapter-zappaz'
+import { createZappazAdapter } from '@zappaz/chat-adapter-zappaz'
 
 const channels = {
   adapters: {
@@ -118,11 +125,123 @@ estar rodando quando o consumidor usa a instância remota.
 Esta seção mostra a configuração de uso com Mastra; o repositório não inclui um agente de teste
 executável. Mastra não é dependência deste pacote.
 
+### Permitir somente alguns usuários
+
+```ts
+const adapter = createZappazAdapter({
+  ...config,
+  allowedUsers: {
+    conversationIds: ['11111111-1111-4111-8111-111111111111'],
+  },
+})
+```
+
+Prefira `conversationIds`: é o UUID interno estável da conversa na sessão configurada. Ele é
+comparado com a mensagem persistida antes de qualquer alias, mesmo sem JID/LID no webhook.
+Não é o ID da thread interna do Mastra. O UUID acima é um exemplo.
+
+Opcionalmente, use `jids: ['5511999999999@s.whatsapp.net']`, `lids: ['123456789@lid']` ou
+`chatIds: ['123456789@lid']`. `jids` exige o endereço completo, `lids` aceita o endereço com
+`@lid` ou somente o ID, e `chatIds` aceita o endereço variável do webhook, que pode ser JID ou LID.
+O campo `chatId` está presente no webhook; o que pode variar é seu valor. `remoteJid` e `lid`
+podem estar ausentes.
+As listas são alternativas (**OU**): basta corresponder a um identificador. Se quiser restringir
+estritamente pelo UUID estável, configure apenas `conversationIds`.
+
+O adapter considera `sender.jid`, `remoteJid`, `lid` e `chatId` após autenticar o webhook e
+confirmar a identidade da mensagem persistida. Se necessário, consulta a conversa da mesma sessão
+para resolver aliases PN/LID do contato. Não depende de `sender.id`, nome ou número parcial.
+Falha nessa consulta retorna **503**, sem acionar o agente. Usuários não permitidos recebem
+**200**, sem dispatch, download de áudio ou transcrição. Isso não bloqueia o contato no WhatsApp.
+
+Omitir `allowedUsers` mantém o comportamento anterior (todos os contatos individuais).
+`allowedUsers: {}` ou listas vazias não permitem ninguém.
+
+### Mensagens de voz e transcrição
+
+Áudio gravado diretamente no WhatsApp (PTT) chega como `type: 'audio'`, com `media.voice: true`.
+O adapter fornece um anexo com download autenticado; normaliza o MIME sem parâmetros de codec e,
+para voz sem MIME/nome, usa `audio/ogg` e `voice.ogg`. Não há conversão de formato.
+
+**Receber o anexo não significa que o modelo ouviu o áudio.** Por padrão, o Mastra não inclui
+áudio em `inlineMedia`. Há dois caminhos:
+
+- **Modelo com suporte ao formato recebido:** configure `channels.inlineMedia` no consumidor,
+  preservando os tipos já necessários, por exemplo:
+
+  ```ts
+  const channels = {
+    adapters: { zappaz: adapter },
+    inlineMedia: ['image/png', 'image/jpeg', 'image/webp', 'application/pdf', 'audio/*'],
+  }
+  ```
+
+  Isso não adiciona suporte de áudio a um modelo que não o tenha. O modelo precisa aceitar
+  também o codec/formato real (normalmente OGG/Opus em mensagens de voz).
+
+- **Modelo somente de texto:** forneça `transcribeAudio`. O callback recebe
+  `{ data: Buffer, mimeType, fileName?, voice, message }` e deve retornar `Promise<string>`.
+  Conecte o seu serviço de speech-to-text; o adapter não escolhe provedor nem lê chaves de IA.
+
+  Exemplo opcional com [OpenAIVoice do Mastra](https://mastra.ai/integrations/voice/openai)
+  (instale `@mastra/voice-openai` no **consumidor** e configure `OPENAI_API_KEY`):
+
+  ```ts
+  import { Readable } from 'node:stream'
+  import { OpenAIVoice } from '@mastra/voice-openai'
+
+  const voice = new OpenAIVoice()
+  const filetypes: Record<string, string> = {
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'audio/wav': 'wav',
+    'audio/webm': 'webm',
+  }
+
+  const adapter = createZappazAdapter({
+    ...config,
+    transcribeAudio: async ({ data, mimeType }) => {
+      const filetype = filetypes[mimeType]
+      if (!filetype) throw new Error('Formato de áudio não suportado pelo transcritor')
+      return voice.listen(Readable.from([data]), { filetype })
+    },
+  })
+  ```
+
+  A transcrição vira texto da mensagem antes do dispatch e do agrupamento. O payload original e
+  o anexo continuam disponíveis. Com esse caminho não é necessário adicionar áudio a `inlineMedia`.
+  Retorno vazio, erro de transcrição ou falha de download retorna **503**, sem acionar o agente.
+  Configure timeout no seu transcritor; ele executa durante a requisição do webhook e pode gerar
+  custos externos. O limite de download continua sendo 25 MiB.
+
+### Respostas a mensagens citadas
+
+Ao usar “Responder” no WhatsApp, o adapter inclui um bloco identificado de **mensagem citada**
+antes da mensagem atual. Preserva ID, remetente e texto da citação; mensagens citadas sem texto
+recebem um marcador como `[audio]` ou `[image]`, sem inventar o conteúdo da mídia.
+
+O snapshot `replyTo` persistido tem prioridade. Quando ausente, o adapter aceita
+`payload.message.replyTo` do webhook autenticado (`id`, `senderId`, `type`, `text`), somente após
+validar a identidade da mensagem atual. A citação normalizada fica em `message.raw.replyTo`.
+O texto citado é limitado a 8.192 caracteres e continua presente com transcrição e agrupamento.
+Não há download automático da mídia citada nem recuperação recursiva de outras citações.
+
+### Qual identificador o Mastra usa?
+
+O adapter identifica a conversa por `zappaz:<sessão em base64url>:<conversationId>`, mantendo
+estabilidade quando o endereçamento muda entre PN e LID. O Mastra mapeia essa thread do canal para
+uma thread interna, com UUID próprio por padrão. O dono da memória (`resourceId`) é, por padrão,
+`zappaz:${message.author.userId}`; `author.userId` usa o JID do remetente persistido, ou
+`conversation:<conversationId>` quando esse JID não está disponível. Esses IDs organizam contexto,
+**não são uma lista de permissões**. `resolveResourceId` e `resolveThreadId` do Mastra customizam
+esse mapeamento para novas threads; threads existentes mantêm os valores armazenados.
+
 ## Usar com Chat SDK diretamente
 
 ```ts
 import { Chat } from 'chat'
-import { createZappazAdapter } from 'chat-adapter-zappaz'
+import { createZappazAdapter } from '@zappaz/chat-adapter-zappaz'
 
 // `state` deve ser um StateAdapter configurado no seu consumidor.
 const bot = new Chat({
@@ -171,7 +290,7 @@ best effort e depende do state do consumidor. Use handlers idempotentes.
 
 Para testar, envie texto ou mídia **de outro número** para a sessão. Mensagens enviadas pela própria
 conta nunca iniciam execuções do agente; podem ativar a pausa humana quando configurada. Quando
-terminar, desative o webhook; esta versão não filtra prefixos nem contatos, e o handler pode responder
+terminar, desative o webhook; sem `allowedUsers`, o handler pode responder
 a toda mensagem individual suportada recebida.
 
 ### Receber imagens, áudios e documentos

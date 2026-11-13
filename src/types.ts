@@ -13,6 +13,24 @@ export interface ZappazAdapterConfig {
   humanPauseMs?: number
   /** Split long outgoing text into messages of at most 4096 characters. Default: true. */
   splitLongMessages?: boolean
+  /** OR allowlist. Omit to allow everyone; an empty object or lists allow nobody. */
+  allowedUsers?: {
+    /** Preferred: stable internal conversation UUIDs, scoped by the configured session. */
+    conversationIds?: string[]
+    jids?: string[]
+    /** Full @lid addresses or bare LID identifiers. */
+    lids?: string[]
+    /** Webhook chatId addresses (PN or LID); use conversationIds for internal UUIDs. */
+    chatIds?: string[]
+  }
+  /** Optional speech-to-text bridge for agents/models that cannot consume audio directly. */
+  transcribeAudio?: (audio: {
+    data: Buffer
+    mimeType: string
+    fileName?: string
+    voice: boolean
+    message: ZappazMessage
+  }) => Promise<string>
 }
 
 export interface ZappazThreadId {
@@ -35,6 +53,20 @@ export const ConfigSchema = z.object({
   debounceMs: z.number().int().min(0).max(60_000).optional(),
   humanPauseMs: z.number().int().min(0).max(2_147_483_647).optional(),
   splitLongMessages: z.boolean().optional(),
+  allowedUsers: z
+    .object({
+      conversationIds: z.array(z.uuid()).optional(),
+      jids: z.array(z.string().trim().min(1)).optional(),
+      lids: z.array(z.string().trim().min(1)).optional(),
+      chatIds: z.array(z.string().trim().min(1)).optional(),
+    })
+    .strict()
+    .optional(),
+  transcribeAudio: z
+    .custom<NonNullable<ZappazAdapterConfig['transcribeAudio']>>(
+      (value) => typeof value === 'function',
+    )
+    .optional(),
 })
 
 export const MediaSchema = z.object({
@@ -52,6 +84,15 @@ export const MediaSchema = z.object({
   voice: z.boolean().optional(),
 })
 
+export const ReplyToSchema = z.object({
+  messageRecordId: z.uuid().nullable().optional(),
+  messageId: z.string().min(1),
+  senderJid: z.string().nullable().optional(),
+  fromMe: z.boolean().nullable().optional(),
+  type: z.string(),
+  text: z.string().nullable(),
+})
+
 export const MessageSchema = z.object({
   id: z.uuid(),
   sessionId: z.string().min(1),
@@ -59,13 +100,14 @@ export const MessageSchema = z.object({
   messageId: z.string().min(1),
   clientRequestId: z.string().nullable().optional(),
   fromMe: z.boolean(),
-  sender: z.object({ jid: z.string().nullable(), name: z.string().nullable() }),
+  sender: z.object({ jid: z.string().nullable().optional(), name: z.string().nullable() }),
   type: z.string(),
   text: z.string().nullable(),
   orderAt: z.iso.datetime(),
   editedAt: z.iso.datetime().nullable(),
   deletedAt: z.iso.datetime().nullable(),
   media: MediaSchema.nullable().optional(),
+  replyTo: ReplyToSchema.nullable().optional(),
 })
 export type ZappazMessage = z.infer<typeof MessageSchema>
 
@@ -97,10 +139,19 @@ export const IncomingMessageSchema = z.object({
     messageId: z.string().min(1).nullable(),
     conversationId: z.uuid().nullable(),
     chatId: z.string().min(1).nullable(),
-    remoteJid: z.string().nullable(),
-    lid: z.string().nullable(),
+    remoteJid: z.string().nullable().optional(),
+    lid: z.string().nullable().optional(),
     fromMe: z.boolean(),
     isGroup: z.boolean(),
     type: z.string(),
+    replyTo: z
+      .object({
+        id: z.string().min(1),
+        text: z.string().nullable(),
+        type: z.string(),
+        senderId: z.string().nullable().optional(),
+      })
+      .nullable()
+      .optional(),
   }),
 })

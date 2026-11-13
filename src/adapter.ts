@@ -79,7 +79,13 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
           const combined = new Message({
             ...last,
             ...this.converter.parseIncoming(
-              messages.map((message) => message.raw.text ?? `[${message.raw.type}]`).join('\n\n'),
+              messages
+                .map((message) =>
+                  message.raw.type === 'audio' && this.config.transcribeAudio
+                    ? message.text
+                    : this.incomingText(message.raw),
+                )
+                .join('\n\n'),
             ),
             attachments: messages.flatMap((message) => message.attachments),
           })
@@ -179,6 +185,94 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
     return true
   }
 
+  private async isAllowedUser(
+    message: ZappazMessage,
+    incoming: z.infer<typeof IncomingMessageSchema>['message'],
+    outgoing: boolean,
+  ): Promise<boolean> {
+    const allowed = this.config.allowedUsers
+    if (!allowed) return true
+    if (allowed.conversationIds?.includes(message.conversationId)) return true
+    const normalizeLid = (value: string) => (value.endsWith('@lid') ? value : `${value}@lid`)
+    const matches = (
+      jids: (string | null | undefined)[],
+      chatIds: (string | null | undefined)[],
+    ) => {
+      return (
+        allowed.jids?.some((id) => jids.includes(id)) ||
+        allowed.lids?.some((id) => jids.includes(normalizeLid(id))) ||
+        allowed.chatIds?.some((id) => chatIds.includes(id)) ||
+        false
+      )
+    }
+    const jids = [
+      ...(!outgoing ? [message.sender.jid] : []),
+      incoming.remoteJid,
+      incoming.lid ? normalizeLid(incoming.lid) : null,
+      incoming.chatId,
+    ]
+    if (matches(jids, [incoming.chatId])) return true
+    if (!allowed.jids?.length && !allowed.lids?.length && !allowed.chatIds?.length) return false
+
+    // Resolve PN/LID aliases from the scoped persisted conversation, not from display names.
+    const { data: conversation } = await this.client.request(
+      `/conversations/${message.conversationId}`,
+      z.object({ data: ConversationSchema }),
+    )
+    if (conversation.id !== message.conversationId || conversation.sessionId !== message.sessionId)
+      throw new ValidationError('zappaz', 'Persisted conversation does not match message identity')
+    return matches(
+      [conversation.jid, conversation.contact?.jid, conversation.contact?.lid],
+      [conversation.jid],
+    )
+  }
+
+  private async transcribeMessage(
+    message: Message<ZappazMessage>,
+  ): Promise<Message<ZappazMessage>> {
+    if (!this.config.transcribeAudio || message.raw.type !== 'audio') return message
+    const attachment = message.attachments.find((item) => item.type === 'audio')
+    if (!attachment?.fetchData || !attachment.mimeType)
+      throw new ValidationError('zappaz', 'Audio transcription requires downloadable typed audio')
+    const audioData = await attachment.fetchData()
+    const transcript = await this.config.transcribeAudio({
+      data: Buffer.isBuffer(audioData) ? audioData : Buffer.from(audioData),
+      mimeType: attachment.mimeType,
+      ...(attachment.name ? { fileName: attachment.name } : {}),
+      voice: message.raw.media?.voice ?? false,
+      message: message.raw,
+    })
+    if (typeof transcript !== 'string' || !transcript.trim() || transcript.length > 65_536)
+      throw new ValidationError('zappaz', 'Audio transcription must contain 1–65536 characters')
+    return new Message({
+      ...message,
+      ...this.converter.parseIncoming(
+        this.incomingText(
+          message.raw,
+          [message.raw.text?.trim(), transcript.trim()].filter(Boolean).join('\n\n'),
+        ),
+      ),
+    })
+  }
+
+  private incomingText(message: ZappazMessage, body?: string): string {
+    if (message.deletedAt) return '[Mensagem apagada]'
+    const text = body ?? message.text ?? `[${message.type}]`
+    const quote = message.replyTo
+    if (!quote) return text
+    const quotedText = quote.text ?? `[${quote.type}]`
+    return [
+      '[Mensagem citada (contexto, não é a mensagem atual)]',
+      `ID: ${quote.messageRecordId ?? quote.messageId}`,
+      ...(quote.senderJid ? [`Remetente: ${quote.senderJid}`] : []),
+      quotedText.slice(0, 8192),
+      ...(quotedText.length > 8192 ? ['[Citação truncada]'] : []),
+      '[Fim da mensagem citada]',
+      '',
+      text,
+    ].join('\n')
+  }
+
   async handleWebhook(request: Request, options?: WebhookOptions): Promise<Response> {
     const received = Buffer.from(request.headers.get('x-zappaz-webhook-secret') ?? '')
     const expected = Buffer.from(this.config.webhookSecret)
@@ -211,7 +305,7 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
       return new Response('Ignored', { status: 200 })
     if (!this.chat) return new Response('Adapter not initialized', { status: 503 })
     try {
-      const message = await this.client.messageFor(incoming.conversationId, incoming.id)
+      let message = await this.client.messageFor(incoming.conversationId, incoming.id)
       if (
         message.sessionId !== this.config.sessionId ||
         message.conversationId !== incoming.conversationId ||
@@ -219,6 +313,19 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
         (incoming.messageId !== null && message.messageId !== incoming.messageId)
       )
         throw new ValidationError('zappaz', 'Persisted message does not match webhook identity')
+      if (!(await this.isAllowedUser(message, incoming, outgoing)))
+        return new Response('Ignored', { status: 200 })
+      if (!message.replyTo && incoming.replyTo)
+        message = {
+          ...message,
+          replyTo: {
+            messageRecordId: null,
+            messageId: incoming.replyTo.id,
+            senderJid: incoming.replyTo.senderId,
+            type: incoming.replyTo.type,
+            text: incoming.replyTo.text,
+          },
+        }
       const threadId = this.encodeThreadId(message)
       if (outgoing) {
         if (!message.fromMe || message.deletedAt) return new Response('Ignored')
@@ -237,7 +344,7 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
       if (message.fromMe || message.deletedAt || !inboundTypes.has(message.type))
         return new Response('Ignored', { status: 200 })
       if (await this.isThreadPaused(threadId)) return new Response('Paused')
-      const parsed = this.parseMessage(message)
+      const parsed = await this.transcribeMessage(this.parseMessage(message))
       if (this.buffer) {
         const fresh = await this.state().setIfNotExists(
           `zappaz:buffered:${threadId}:${message.id}`,
@@ -276,11 +383,16 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
         media.messageRecordId !== message.id
       )
         throw new ValidationError('zappaz', 'Missing or mismatched persisted media')
+      const mimeType =
+        media.mimeType?.split(';')[0]?.trim().toLowerCase() ||
+        (message.type === 'audio' && media.voice ? 'audio/ogg' : undefined)
+      const fileName =
+        media.fileName || (message.type === 'audio' && media.voice ? 'voice.ogg' : undefined)
       attachments.push(
         this.rehydrateAttachment({
           type: attachmentType,
-          ...(media.mimeType ? { mimeType: media.mimeType } : {}),
-          ...(media.fileName ? { name: media.fileName } : {}),
+          ...(mimeType ? { mimeType } : {}),
+          ...(fileName ? { name: fileName } : {}),
           ...(media.size !== null ? { size: media.size } : {}),
           ...(media.width !== null ? { width: media.width } : {}),
           ...(media.height !== null ? { height: media.height } : {}),
@@ -295,9 +407,7 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
     return new Message({
       id: message.id,
       threadId: this.encodeThreadId(message),
-      ...this.converter.parseIncoming(
-        message.deletedAt ? '[Mensagem apagada]' : (message.text ?? `[${message.type}]`),
-      ),
+      ...this.converter.parseIncoming(this.incomingText(message)),
       raw: message,
       author: {
         fullName: message.sender.name ?? '',
