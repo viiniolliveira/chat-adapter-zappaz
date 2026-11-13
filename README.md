@@ -8,8 +8,9 @@ Conecta um agente às mensagens individuais de WhatsApp de uma sessão Zappaz, u
 HTTP e os webhooks normalizados. O adapter roda **no consumidor**, não dentro da Zappaz, e não
 depende de Prisma ou Baileys.
 
-**Versão inicial experimental:** texto e histórico. Este repositório é público, mas o pacote ainda
-não foi publicado no npm.
+**Versão experimental:** texto e arquivos, citação de mensagens, histórico bidirecional,
+agrupamento opcional de mensagens e pausa para atendimento humano. Este repositório é público,
+mas o pacote ainda não foi publicado no npm.
 
 ## Requisitos
 
@@ -63,6 +64,9 @@ const adapter = createZappazAdapter({
 | `sessionId` | Sessão atendida por esta instância do adapter. |
 | `webhookSecret` | Segredo aleatório com pelo menos 16 caracteres, compartilhado com o webhook. |
 | `userName` | Nome do bot; opcional, padrão `zappaz-bot`. |
+| `debounceMs` | Janela de agrupamento, de 0 a 60.000 ms. Padrão: 0 (desativado). |
+| `humanPauseMs` | Duração da pausa após saída humana, até 2.147.483.647 ms. Padrão: 0 (desativado). |
+| `splitLongMessages` | Divide textos longos em partes de até 4.096 caracteres. Padrão: `true`. |
 
 O adapter não lê variáveis de ambiente automaticamente. Injete a configuração pelo consumidor,
 valide seu ambiente na inicialização e nunca versione chaves reais. Use HTTPS fora do
@@ -141,14 +145,17 @@ mecanismo de continuação da plataforma para manter o processamento após a res
 ## Configurar o webhook na Zappaz
 
 Crie um webhook **na sessão escolhida**, apontando para a URL pública do consumidor. Habilite
-somente `inbound-message.upsert` e adicione:
+`inbound-message.upsert` e configure o campo `secret` com o mesmo `webhookSecret` do adapter.
+Se usar `humanPauseMs`, habilite também `outbound-message.upsert` e `messages.send`.
+A Zappaz envia esse segredo automaticamente no header:
 
 ```json
-{ "Authorization": "Bearer change-me-use-a-random-secret" }
+{ "X-Zappaz-Webhook-Secret": "change-me-use-a-random-secret" }
 ```
 
-O token Bearer deve ser o `webhookSecret` da configuração do adapter. É uma autenticação pelo
-header `Authorization`, não uma assinatura HMAC do corpo. Não use a API Key como segredo do webhook.
+O valor é o segredo puro, sem prefixo Bearer. Não configure esse header nos headers adicionais:
+ele é reservado pela Zappaz. Não há assinatura HMAC do corpo nem fallback para `Authorization`.
+Não use a API Key como segredo do webhook; a API REST usa `x-api-key` separadamente.
 
 - Header inválido: **401**.
 - JSON ou mensagem inválida: **400**.
@@ -162,9 +169,115 @@ A Zappaz grava falhas de entrega nos logs; não presuma retry automático. Reenv
 efeitos colaterais dos handlers precisam ser tratados com cuidado. A deduplicação do Chat SDK é
 best effort e depende do state do consumidor. Use handlers idempotentes.
 
-Para testar, envie texto **de outro número** para a sessão. Mensagens enviadas pela própria conta
-são ignoradas para impedir loops. Quando terminar, desative o webhook; esta versão não filtra
-prefixos nem contatos, e o handler pode responder a todo texto individual recebido.
+Para testar, envie texto ou mídia **de outro número** para a sessão. Mensagens enviadas pela própria
+conta nunca iniciam execuções do agente; podem ativar a pausa humana quando configurada. Quando
+terminar, desative o webhook; esta versão não filtra prefixos nem contatos, e o handler pode responder
+a toda mensagem individual suportada recebida.
+
+### Receber imagens, áudios e documentos
+
+Imagens, áudios, documentos, vídeos e stickers acionam o mesmo handler de DM. O texto ou legenda
+persistida fica em `message.text`; sem texto, usa-se `[image]`, `[audio]` etc. Os arquivos ficam em
+`message.attachments`: imagens/stickers usam `image`, documentos usam `file`, e áudio/vídeo usam
+`audio`/`video`. Cada anexo tem os metadados disponíveis e `fetchData()` para baixar os bytes:
+
+```ts
+bot.onDirectMessage(async (thread, message) => {
+  for (const attachment of message.attachments) {
+    if (attachment.type === 'image' && attachment.fetchData) {
+      const bytes = await attachment.fetchData()
+      // Encaminhe os bytes a um modelo com suporte a imagens ou processe-os aqui.
+    }
+  }
+  await thread.post('Mensagem recebida!')
+})
+```
+
+O download é sob demanda, autenticado internamente com `x-api-key`, usando a rota de mídia da
+conversa na Zappaz. Não há URL pública nem credenciais nos anexos. Cada download tem timeout de
+15 segundos e limite de 25 MiB, verificado também durante a leitura. Falhas de download são
+propagadas a quem chamou `fetchData()`; não há retry automático. O webhook aceita a mensagem
+antes desse download, portanto aceite não garante disponibilidade do arquivo.
+
+Anexos também são disponibilizados no histórico e podem ser reidratados pelo Chat SDK após
+serialização. O adapter não faz OCR ou descrição de imagens por conta própria: configure um
+modelo multimodal e uma integração que consuma os anexos. `toAiMessages` do Chat SDK suporta
+imagens e alguns arquivos de texto, mas não transcreve áudio nem interpreta PDF/vídeo automaticamente.
+Baixe esses anexos com `fetchData()` e encaminhe-os ao serviço/modelo adequado no consumidor.
+
+### Enviar arquivos e responder com citação
+
+```ts
+await thread.post({
+  raw: 'Confira o documento',
+  files: [{ data: Buffer.from(pdfBytes), filename: 'relatorio.pdf', mimeType: 'application/pdf' }],
+})
+
+await adapter.reply(thread.id, message.id, 'Resposta citando a mensagem original')
+await adapter.reply(thread.id, message.id, {
+  raw: 'Foto solicitada',
+  files: [{ data: Buffer.from(imageBytes), filename: 'foto.png', mimeType: 'image/png' }],
+})
+```
+
+Envios usam multipart na rota `/conversations/:conversationId/messages/media`. Aceitam até 10
+arquivos por post, cada um de 1 byte a 25 MiB; `data` aceita Buffer, Blob ou ArrayBuffer.
+O MIME informado ou inferido pela extensão seleciona imagem, áudio, vídeo ou documento; a Zappaz
+valida os bytes e suas próprias políticas. URLs não são baixadas automaticamente pelo adapter.
+Anexos de saída em `attachments` também são aceitos quando fornecem `data` binário.
+
+Uma legenda curta acompanha o primeiro arquivo. Para áudio, o texto é enviado separadamente para
+não ser descartado pelo backend. Texto longo é enviado em partes antes dos arquivos. Citações usam
+o UUID interno, não o ID WhatsApp, e valem também para arquivos e textos divididos.
+
+Os envios são sequenciais e não transacionais: uma falha pode ocorrer depois de algumas partes
+terem sido enviadas. Não repita o post inteiro automaticamente. `postMessage()` e `reply()` retornam
+o registro da **última** parte; edição/exclusão desse ID afetam apenas essa parte.
+Use `adapter.postMessages(thread.id, conteudo, uuidCitadoOpcional)` para obter todos os registros.
+
+### Agrupar mensagens antes de executar o agente
+
+```ts
+const adapter = createZappazAdapter({ ...config, debounceMs: 5000 })
+```
+
+Cada conversa tem seu lote. A cada mensagem suportada, o prazo é reiniciado; após a pausa, o
+handler recebe uma única mensagem com os textos/legendas concatenados e todos os anexos. O ID,
+autor e `raw` são os da última mensagem. Há flush automático aos 100 itens, 65.536 caracteres
+ou após até 60 segundos de janela contínua. Os lotes de uma conversa executam sequencialmente.
+Reenvios são deduplicados por ID no state por 5 minutos antes de entrar no buffer.
+
+O buffer é **local e em memória**: reinícios perdem lotes pendentes e múltiplas instâncias não
+compartilham o agrupamento. Use um processo persistente ou `waitUntil` com prazo suficiente;
+não é uma fila durável. Não combine esse agrupamento com outro debounce do consumidor sem avaliar
+o atraso adicional. Falhas do handler são registradas no logger, sem retry automático.
+`disconnect()` descarta lotes pendentes e aguarda os já iniciados.
+
+### Pausa para atendimento humano
+
+```ts
+const adapter = createZappazAdapter({ ...config, humanPauseMs: 5 * 60 * 1000 })
+
+await adapter.pauseThread(threadId, 10 * 60 * 1000) // Pausa manual
+await adapter.isThreadPaused(threadId)
+await adapter.resumeThread(threadId)
+```
+
+Com a opção habilitada e os eventos de saída cadastrados, mensagens próprias persistidas que não
+foram enviadas por este adapter pausam a conversa. Envios do bot são reconhecidos pelo
+`clientRequestId` registrado no state **antes** da chamada à API. O DTO da API precisa preservar
+esse campo. Outras integrações são consideradas atendimento humano. Eventos antigos não renovam
+a pausa: o prazo considera `orderAt` da mensagem de saída.
+
+O state do Chat SDK armazena a pausa e as marcas dos envios; use storage compartilhado e persistente
+em produção. A pausa cancela lotes pendentes, solicita `abortTurn()` e bloqueia novos posts,
+respostas citadas e edições até expirar ou ser removida. Entrada durante a pausa recebe 200 e não é
+reexecutada automaticamente depois. A exclusão continua disponível. Métodos manuais requerem
+adapter inicializado; funcionam também sem detecção automática configurada.
+
+A pausa é best effort: uma requisição já em trânsito não pode ser desfeita e o consumidor precisa
+respeitar cancelamento para interromper trabalho externo. Uma nova pausa não encurta uma pausa
+mais longa já registrada; atualizações simultâneas entre processos não são uma transação global.
 
 ## Identidade, histórico e limites
 
@@ -181,26 +294,33 @@ prefixos nem contatos, e o handler pode responder a todo texto individual recebi
   `message.raw.messageId`. Edição e exclusão usam o UUID interno, escopado pela conversa e sessão.
 - Não cria contatos na agenda, não abre conversas e não acessa diretamente o banco da Zappaz.
 - `fromMe` não é convertido em `author.isMe`: uma mensagem manual do operador não é atribuída ao
-  bot. Eventos de saída não iniciam execuções; não há pausa automática para atendimento humano.
+  bot. Eventos de saída não iniciam execuções; a detecção de atendimento humano é opcional.
 - O texto vem do registro persistido. Mensagens removidas antes do processamento são ignoradas.
   Eventos de histórico/reenvios podem iniciar execuções quando ainda não deduplicados: o envelope
   atual não distingue sync de mensagem ao vivo.
-- Envio, edição e exclusão para todos dependem das permissões e restrições do WhatsApp. Envios do
-  adapter desativam a assinatura naquele envio, sem alterar a configuração da sessão.
-- Histórico é retornado em ordem cronológica, com paginação **para trás** e cursores opacos.
-  Paginação para frente lança `NotImplementedError` nesta versão.
+- Envio, edição e exclusão para todos dependem das permissões e restrições do WhatsApp. Envios de
+  texto desativam a assinatura naquele envio; mídia segue a política do endpoint da Zappaz.
+- Histórico é retornado em ordem cronológica, com cursores opacos. O padrão é paginação para trás
+  (`before`); `fetchMessages(threadId, { direction: 'forward', cursor })` usa `after`.
+  Sem cursor, a API não oferece início direto pelo mais antigo: o adapter percorre páginas para
+  trás e usa `boundaries.last` da página mais antiga para continuar para frente, sem inventar
+  cursores. Essa busca inicial é limitada a 100 páginas e a um orçamento de 30 segundos verificado
+  entre requisições; exceder o orçamento gera erro explícito, não histórico incompleto silencioso.
 - Markdown é convertido para a formatação WhatsApp. Títulos viram negrito e links preservam texto
   e destino. O parser de entrada usa os limites de segurança de `BaseFormatConverter.parseIncoming`.
-- Texto final precisa ter **1–4096 caracteres**, não apenas espaços. Não há truncamento ou divisão
-  automática. `stream()` acumula e envia uma única mensagem ao final, respeitando cancelamento e
-  um orçamento de entrada de 65.536 caracteres; o limite final continua sendo 4096.
+- Cada mensagem de texto tem **1–4096 caracteres**, não apenas espaços. Posts de até 65.536
+  caracteres são divididos automaticamente, sem truncamento ou corte de pares UTF-16; a quebra
+  prefere espaços/linhas. Estilos Markdown que atravessam partes podem perder formatação.
+  `splitLongMessages: false` restaura o limite de 4096 por post. Edições continuam limitadas a 4096.
+  `stream()` acumula até 65.536 caracteres e envia ao final, possivelmente em várias partes;
+  cancelamento é conferido durante a acumulação e antes do envio.
 - Requisições têm timeout de 15 segundos. Escritas não são repetidas automaticamente, nem após
   timeout/5xx, para evitar envios duplicados. Redirecionamentos HTTP são recusados.
 - Logs de resolução/dispatch usam o logger do Chat SDK, sem incluir segredo, payload ou texto.
 
 ### Ainda sem suporte
 
-Mídias de entrada não acionam o agente. Arquivos de saída, cards, botões, reações e digitação
+Grupos, cards, botões, reações e digitação continuam sem suporte. Cards, reações e digitação
 lançam erro explícito de recurso não implementado. Não adicione as ferramentas de reação do canal;
 use `typingStatus: false` e `toolDisplay: 'text'` ou `'hidden'` no Mastra.
 

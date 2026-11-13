@@ -13,7 +13,7 @@ import { MessageSchema, type ZappazAdapterConfig, type ZappazMessage } from './t
 export class ZappazClient {
   constructor(private readonly config: ZappazAdapterConfig) {}
 
-  async request<T>(path: string, schema: z.ZodType<T>, method = 'GET', body?: unknown): Promise<T> {
+  private async response(path: string, method = 'GET', body?: unknown): Promise<Response> {
     let response: Response
     try {
       response = await fetch(
@@ -22,9 +22,12 @@ export class ZappazClient {
           method,
           headers: {
             'x-api-key': this.config.apiKey,
-            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            ...(body === undefined || body instanceof FormData
+              ? {}
+              : { 'content-type': 'application/json' }),
           },
-          body: body === undefined ? undefined : JSON.stringify(body),
+          body:
+            body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body),
           redirect: 'error',
           signal: AbortSignal.timeout(15_000),
         },
@@ -48,6 +51,11 @@ export class ZappazClient {
         'zappaz',
         String(response.status),
       )
+    return response
+  }
+
+  async request<T>(path: string, schema: z.ZodType<T>, method = 'GET', body?: unknown): Promise<T> {
+    const response = await this.response(path, method, body)
     let data: unknown
     try {
       data = await response.json()
@@ -63,6 +71,43 @@ export class ZappazClient {
     const result = schema.safeParse(data)
     if (!result.success) throw new ValidationError('zappaz', 'Invalid Zappaz API response')
     return result.data
+  }
+
+  async mediaData(conversationId: string, mediaId: string): Promise<Buffer> {
+    const response = await this.response(
+      `/conversations/${z.uuid().parse(conversationId)}/media/${z.uuid().parse(mediaId)}/content`,
+    )
+    const maxBytes = 25 * 1024 * 1024
+    if (Number(response.headers.get('content-length')) > maxBytes) {
+      await response.body?.cancel()
+      throw new ValidationError('zappaz', 'Media exceeds the 25 MiB download limit')
+    }
+    const reader = response.body?.getReader()
+    if (!reader) throw new ValidationError('zappaz', 'Empty media response')
+    const chunks: Buffer[] = []
+    let size = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        size += value.byteLength
+        if (size > maxBytes)
+          throw new ValidationError('zappaz', 'Media exceeds the 25 MiB download limit')
+        chunks.push(Buffer.from(value))
+      }
+    } catch (error) {
+      await reader.cancel().catch(() => {})
+      if (error instanceof ValidationError) throw error
+      throw new NetworkError(
+        'zappaz',
+        'Unable to read Zappaz media response',
+        error instanceof Error ? error : undefined,
+      )
+    } finally {
+      reader.releaseLock()
+    }
+    if (!size) throw new ValidationError('zappaz', 'Empty media response')
+    return Buffer.concat(chunks, size)
   }
 
   async messageFor(conversationId: string, messageRecordId: string): Promise<ZappazMessage> {
