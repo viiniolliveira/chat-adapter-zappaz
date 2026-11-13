@@ -8,13 +8,7 @@ import {
   ValidationError,
 } from '@chat-adapter/shared'
 import { z } from 'zod'
-import {
-  ConversationSchema,
-  MessageSchema,
-  PageSchema,
-  type ZappazAdapterConfig,
-  type ZappazMessage,
-} from './types.ts'
+import { MessageSchema, type ZappazAdapterConfig, type ZappazMessage } from './types.ts'
 
 export class ZappazClient {
   constructor(private readonly config: ZappazAdapterConfig) {}
@@ -71,50 +65,11 @@ export class ZappazClient {
     return result.data
   }
 
-  async conversationFor(identifiers: string[]): Promise<string> {
-    const identities = new Set(identifiers)
-    const query = identifiers[0].split('@')[0]
-    let cursor: string | null = null
-    do {
-      const params: URLSearchParams = new URLSearchParams({
-        q: query,
-        limit: '100',
-        ...(cursor ? { cursor } : {}),
-      })
-      const result = await this.request(
-        `/conversations?${params}`,
-        z.object({ data: z.array(ConversationSchema), page: PageSchema }),
-      )
-      const match = result.data.find((conversation) => {
-        const contact = conversation.contact
-        return [
-          conversation.jid,
-          contact?.jid,
-          contact?.lid,
-          contact?.phoneNumber ? `${contact.phoneNumber}@s.whatsapp.net` : null,
-        ].some((id) => id !== null && id !== undefined && identities.has(id))
-      })
-      if (match) return match.id
-      cursor = result.page.hasMore ? result.page.nextCursor : null
-    } while (cursor)
-    throw new ResourceNotFoundError('zappaz', 'conversation')
-  }
-
-  async messageFor(conversationId: string, messageId: string): Promise<ZappazMessage> {
-    let cursor: string | null = null
-    do {
-      const params: URLSearchParams = new URLSearchParams({
-        limit: '100',
-        ...(cursor ? { before: cursor } : {}),
-      })
-      const result = await this.request(
-        `/conversations/${conversationId}/messages?${params}`,
-        z.object({ data: z.array(MessageSchema), page: PageSchema }),
-      )
-      const match = result.data.find((message) => message.messageId === messageId)
-      if (match) return match
-      cursor = result.page.hasMore ? result.page.nextCursor : null
-    } while (cursor)
-    throw new ResourceNotFoundError('zappaz', 'message', messageId)
+  async messageFor(conversationId: string, messageRecordId: string): Promise<ZappazMessage> {
+    const result = await this.request(
+      `/conversations/${conversationId}/messages/${messageRecordId}`,
+      z.object({ data: MessageSchema }),
+    )
+    return result.data
   }
 }

@@ -13,7 +13,9 @@ não foi publicado no npm.
 
 ## Requisitos
 
-- Uma instância Zappaz com API de conversas/mensagens e webhooks normalizados com PN/LID.
+- Uma instância Zappaz com API de conversas/mensagens e o novo contrato de webhooks: `id`
+  (UUID interno), `messageId` (ID WhatsApp) e `conversationId`, sempre presentes e anuláveis.
+  O contrato antigo não é suportado.
 - Uma sessão WhatsApp conectada, habilitada e uma API Key autorizada para essa sessão.
 - Chat SDK `^4.44.0` no consumidor; Node.js 22+ ou Bun.
 - Bun para instalar, desenvolver e compilar este pacote ESM.
@@ -151,7 +153,8 @@ header `Authorization`, não uma assinatura HMAC do corpo. Não use a API Key co
 - Header inválido: **401**.
 - JSON ou mensagem inválida: **400**.
 - Sessão diferente da configurada: **403**.
-- Eventos não suportados, grupos e mensagens próprias: **200**, sem acionar o agente.
+- Eventos não suportados, grupos, mensagens próprias e eventos sem UUID de mensagem ou conversa:
+  **200**, sem acionar o agente.
 - Falha ao localizar a mensagem persistida: **503**.
 - Mensagem aceita para processamento: **200**; isso não garante que o agente já respondeu.
 
@@ -167,9 +170,13 @@ prefixos nem contatos, e o handler pode responder a todo texto individual recebi
 
 - Cada instância atende uma sessão. Thread IDs usam
   `zappaz:<sessão em base64url>:<UUID interno da conversa>`. Alterar o endereçamento entre PN e LID
-  não troca o thread. O adapter compara os identificadores exatamente, nunca pelo nome.
-- Como o webhook não inclui o UUID interno, a resolução consulta conversas por busca paginada e
-  depois localiza a mensagem persistida pelo ID WhatsApp. A API deve preservar a identidade PN/LID.
+  não troca o thread. A identidade vem dos UUIDs confirmados na persistência, nunca do nome ou JID.
+- O webhook fornece `payload.message.id` (UUID interno), `payload.message.messageId` (ID WhatsApp)
+  e `payload.message.conversationId` (UUID interno da conversa). A resolução faz uma única consulta:
+  `GET /api/v1/session/:sessionId/conversations/:conversationId/messages/:messageRecordId`.
+  Não pesquisa conversas, não percorre o histórico e não usa o ID WhatsApp como fallback.
+  Eventos com `id` ou `conversationId` nulo são ignorados. A resposta precisa corresponder à sessão,
+  conversa e UUID recebidos; o ID WhatsApp também é conferido quando não nulo no webhook.
 - O ID da mensagem no Chat SDK é o UUID interno da Zappaz; o ID WhatsApp fica em
   `message.raw.messageId`. Edição e exclusão usam o UUID interno, escopado pela conversa e sessão.
 - Não cria contatos na agenda, não abre conversas e não acessa diretamente o banco da Zappaz.

@@ -117,15 +117,24 @@ export class ZappazAdapter implements Adapter<ZappazThreadId, ZappazMessage> {
     const payload = IncomingMessageSchema.safeParse(event.data.payload)
     if (!payload.success) return new Response('Invalid message', { status: 400 })
     const incoming = payload.data.message
-    if (incoming.fromMe || incoming.isGroup || incoming.type !== 'text')
+    if (
+      incoming.fromMe ||
+      incoming.isGroup ||
+      incoming.type !== 'text' ||
+      incoming.id === null ||
+      incoming.conversationId === null
+    )
       return new Response('Ignored', { status: 200 })
     if (!this.chat) return new Response('Adapter not initialized', { status: 503 })
     try {
-      const identifiers = [incoming.remoteJid, incoming.lid, incoming.chatId]
-        .filter((id): id is string => id !== null)
-        .map((id) => id.replace(/:\d+(?=@)/, ''))
-      const conversationId = await this.client.conversationFor(identifiers)
-      const message = await this.client.messageFor(conversationId, incoming.id)
+      const message = await this.client.messageFor(incoming.conversationId, incoming.id)
+      if (
+        message.sessionId !== this.config.sessionId ||
+        message.conversationId !== incoming.conversationId ||
+        message.id !== incoming.id ||
+        (incoming.messageId !== null && message.messageId !== incoming.messageId)
+      )
+        throw new ValidationError('zappaz', 'Persisted message does not match webhook identity')
       if (message.fromMe || message.deletedAt || message.type !== 'text')
         return new Response('Ignored', { status: 200 })
       const parsed = this.parseMessage(message)

@@ -67,8 +67,10 @@ export const WebhookSchema = z.object({
 
 export const IncomingMessageSchema = z.object({
   message: z.object({
-    id: z.string().min(1),
-    chatId: z.string().min(1),
+    id: z.uuid().nullable(),
+    messageId: z.string().min(1).nullable(),
+    conversationId: z.uuid().nullable(),
+    chatId: z.string().min(1).nullable(),
     remoteJid: z.string().nullable(),
     lid: z.string().nullable(),
     fromMe: z.boolean(),

@@ -48,7 +48,6 @@ const conversation = {
   displayName: 'Maria',
   contact: { jid: phone, phoneNumber: '5511999999999', lid },
 }
-const page = { hasMore: false, nextCursor: null }
 
 function request(body: unknown = webhook(), secret: string | null = config.webhookSecret): Request {
   return new Request('https://mastra.example/webhook', {
@@ -67,7 +66,9 @@ function webhook(overrides: Record<string, unknown> = {}) {
     session: { id: config.sessionId },
     payload: {
       message: {
-        id: raw.messageId,
+        id: recordId,
+        messageId: raw.messageId,
+        conversationId,
         chatId: phone,
         remoteJid: phone,
         lid,
@@ -100,9 +101,7 @@ function mockApi(handler?: (url: URL, init?: RequestInit) => Response | Promise<
     expect(new Headers(init?.headers).get('x-api-key')).toBe(config.apiKey)
     expect(init?.redirect).toBe('error')
     if (handler) return handler(url, init)
-    if (url.pathname.endsWith('/conversations'))
-      return Response.json({ data: [conversation], page })
-    return Response.json({ data: [raw], page })
+    return Response.json({ data: raw })
   }
   fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
     Object.assign(implementation, { preconnect }),
@@ -316,38 +315,48 @@ describe('Zappaz Chat SDK adapter', () => {
   })
 
   test('returns 503 instead of accepting an unresolved persisted message', async () => {
-    mockApi(() => Response.json({ data: [], page }))
+    const api = mockApi(() => new Response(null, { status: 404 }))
     const { adapter } = await setup()
     expect((await adapter.handleWebhook(request())).status).toBe(503)
+    expect(api).toHaveBeenCalledTimes(1)
   })
 
-  test('matches identifiers exactly, never contact display names', async () => {
-    mockApi(() =>
-      Response.json({
-        data: [{ ...conversation, jid: 'different@lid', contact: null, displayName: phone }],
-        page,
-      }),
-    )
-    const { adapter } = await setup()
-    expect((await adapter.handleWebhook(request())).status).toBe(503)
+  test('rejects persisted messages that do not match the webhook identity', async () => {
+    const received: Message[] = []
+    const { adapter } = await setup(async (message) => {
+      received.push(message)
+    })
+    for (const override of [
+      { sessionId: 'other-session' },
+      { conversationId: otherRecordId },
+      { id: otherRecordId },
+      { messageId: 'OTHER_WA_ID' },
+    ]) {
+      const api = mockApi(() => Response.json({ data: { ...raw, ...override } }))
+      expect((await adapter.handleWebhook(request())).status).toBe(503)
+      expect(api).toHaveBeenCalledTimes(1)
+      api.mockRestore()
+    }
+    expect(received).toHaveLength(0)
   })
 
-  test('paginates lookup of conversations and messages', async () => {
+  test('fetches the persisted message by internal UUID in a single request', async () => {
     const received: Message[] = []
     const tasks: Promise<unknown>[] = []
-    const api = mockApi((url) => {
-      const paginated = url.searchParams.has('cursor') || url.searchParams.has('before')
-      return Response.json({
-        data: paginated ? (url.pathname.endsWith('/conversations') ? [conversation] : [raw]) : [],
-        page: paginated ? page : { hasMore: true, nextCursor: 'opaque-cursor' },
-      })
+    const api = mockApi((url, init) => {
+      expect(init?.method).toBe('GET')
+      expect(url.pathname).toBe(
+        `/api/v1/session/session%3Aone/conversations/${conversationId}/messages/${recordId}`,
+      )
+      expect(url.search).toBe('')
+      return Response.json({ data: raw })
     })
     const { adapter } = await setup(async (message) => {
       received.push(message)
     })
     expect(
       (
-        await adapter.handleWebhook(request(), {
+        await adapter.handleWebhook(request(webhook({ text: 'Untrusted webhook text' })), {
           waitUntil: (task) => {
             tasks.push(task)
           },
@@ -356,7 +365,76 @@ describe('Zappaz Chat SDK adapter', () => {
     ).toBe(200)
     await Promise.all(tasks)
     expect(received).toHaveLength(1)
-    expect(api).toHaveBeenCalledTimes(4)
+    expect(received[0].id).toBe(recordId)
+    expect(received[0].raw).toMatchObject({ messageId: raw.messageId })
+    expect(received[0].text).toBe('Olá')
+    expect(api).toHaveBeenCalledTimes(1)
+  })
+
+  test('ignores events without a persisted record without querying or inventing IDs', async () => {
+    const api = mockApi()
+    const adapter = createZappazAdapter(config)
+    for (const override of [
+      { id: null },
+      { conversationId: null },
+      { id: null, conversationId: null, messageId: null, chatId: null },
+      { id: null, conversationId: null, type: 'reaction' },
+    ])
+      expect((await adapter.handleWebhook(request(webhook(override)))).status).toBe(200)
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  test('rejects legacy or malformed webhook identities without fallback', async () => {
+    const api = mockApi()
+    const adapter = createZappazAdapter(config)
+    const legacy = webhook().payload.message as Record<string, unknown>
+    legacy.id = raw.messageId
+    delete legacy.messageId
+    delete legacy.conversationId
+    expect(
+      (await adapter.handleWebhook(request({ ...webhook(), payload: { message: legacy } }))).status,
+    ).toBe(400)
+    for (const override of [
+      { id: raw.messageId },
+      { conversationId: 'invalid' },
+      { id: undefined },
+      { conversationId: undefined },
+      { messageId: undefined },
+      { messageId: '' },
+    ])
+      expect((await adapter.handleWebhook(request(webhook(override)))).status).toBe(400)
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  test('resolves internal IDs even when WhatsApp addressing fields are null', async () => {
+    const received: Message[] = []
+    const tasks: Promise<unknown>[] = []
+    const api = mockApi()
+    const { adapter } = await setup(async (message) => {
+      received.push(message)
+    })
+    const response = await adapter.handleWebhook(
+      request(webhook({ messageId: null, chatId: null, remoteJid: null, lid: null })),
+      { waitUntil: (task) => tasks.push(task) },
+    )
+    expect(response.status).toBe(200)
+    await Promise.all(tasks)
+    expect(received).toHaveLength(1)
+    expect(received[0].raw).toMatchObject({ messageId: raw.messageId })
+    expect(api).toHaveBeenCalledTimes(1)
+  })
+
+  test('ignores persisted outgoing, deleted and non-text messages', async () => {
+    const received: Message[] = []
+    const { adapter } = await setup(async (message) => {
+      received.push(message)
+    })
+    for (const override of [{ fromMe: true }, { deletedAt: raw.orderAt }, { type: 'image' }]) {
+      const api = mockApi(() => Response.json({ data: { ...raw, ...override } }))
+      expect((await adapter.handleWebhook(request())).status).toBe(200)
+      api.mockRestore()
+    }
+    expect(received).toHaveLength(0)
   })
 
   test('sends formatted text with an internal request ID and without session signatures', async () => {
